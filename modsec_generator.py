@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 from datetime import date
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,6 +16,16 @@ client = OpenAI(
 
 def generate_modsec_rule(cve_info):
     """Отправляет данные о CVE в LLM и получает черновик правила ModSecurity."""
+    
+    syntax_example = """
+    Пример корректного правила:
+    SecRule ARGS|REQUEST_URI "@rx (?i)(union.*select|select.*from)" \\
+        "id:9000001,phase:2,deny,status:403,msg:'SQLi attempt',severity:CRITICAL,tag:'sqli'"
+
+    ВАЖНО: первый аргумент SecRule — имя переменной БЕЗ макроса %{}.
+    НЕПРАВИЛЬНО: SecRule %{REQUEST_URI} ...
+    ПРАВИЛЬНО:   SecRule REQUEST_URI ...
+    """
 
     prompt = f"""Ты — эксперт по веб-безопасности и ModSecurity (CRS).
 
@@ -28,13 +39,23 @@ def generate_modsec_rule(cve_info):
 1. Определи, можно ли детектировать эксплуатацию этой уязвимости на уровне WAF (HTTP-трафик).
    Если НЕЛЬЗЯ (supply chain, локальная атака, атака вне HTTP) — так и напиши, объясни почему.
 2. Если МОЖНО — предложи черновик правила ModSecurity.
-   Требования к правилу:
-   - Укажи фазу (phase:1 или phase:2 в зависимости от вектора)
-   - Используй SecRule с оператором @rx (регулярка) или @pm (pattern match)
-   - Добавь обязательные actions: id, phase, deny, status:403, msg, severity, tag
-   - id выбери в диапазоне 9000000-9999999 (кастомные правила)
-   - Объясни, что делает каждая часть правила
-   - Укажи риск ложных срабатываний (low/medium/high) и почему
+
+{syntax_example}
+
+Требования к правилу:
+- Укажи фазу (phase:1 или phase:2 в зависимости от вектора)
+- Используй SecRule с оператором @rx (регулярка) или @pm (pattern match)
+- Добавь обязательные actions: id, phase, deny, status:403, msg, severity, tag
+- id выбери в диапазоне 9000000-9999999 (кастомные правила)
+- Объясни, что делает каждая часть правила
+- Укажи риск ложных срабатываний (low/medium/high) и почему
+
+Допустимые переменные ModSecurity (используй ТОЛЬКО эти):
+REQUEST_URI, REQUEST_LINE, REQUEST_METHOD, REQUEST_HEADERS,
+REQUEST_HEADERS:<name>, REQUEST_COOKIES, REQUEST_BODY,
+ARGS, ARGS_GET, ARGS_POST, ARGS_NAMES, REQUEST_FILENAME, FILES, FILES_NAMES
+
+ЗАПРЕЩЕНО выдумывать переменные. Если не уверен — используй ARGS.
 
 Формат ответа — JSON:
 {{
@@ -53,8 +74,7 @@ def generate_modsec_rule(cve_info):
         timeout=120,
     )
 
-    return response.choices[0].message.content
-
+    return response.choices[0].message.content  
 
 def parse_llm_response(raw_response):
     """Извлекает JSON из ответа LLM, убирая возможные markdown-обёртки."""
@@ -94,23 +114,58 @@ def save_rule(cve_id, parsed, output_dir="rules"):
     return filename
 
 
-if __name__ == "__main__":
-    cve_id = "CVE-2021-44228"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Генератор черновиков правил ModSecurity для CVE."
+    )
+    parser.add_argument(
+        "cve_id",
+        help="ID уязвимости, например CVE-2021-44228",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default="rules",
+        help="Папка для сохранения правил (по умолчанию: rules)",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Не сохранять в файл, только вывести в терминал",
+    )
+    args = parser.parse_args()
 
-    print(f"→ Загружаю данные о {cve_id}...")
-    data = fetch_cve(cve_id)
+    print(f"Загружаю данные о {args.cve_id}...")
+    data = fetch_cve(args.cve_id)
+    if data is None:
+        print(f"Не удалось получить данные о {args.cve_id}. Проверь ID.")
+        return
+
     info = extract_cve_info(data)
+    if info is None:
+        print(f"Не удалось извлечь информацию о {args.cve_id}.")
+        return
 
-    print(f"→ Генерирую правило через LLM...")
+    print(f"Генерирую правило через LLM...")
     raw = generate_modsec_rule(info)
 
-    print(f"→ Парсю ответ...")
-    parsed = parse_llm_response(raw)
+    print(f"Собираю ответ...")
+    try:
+        parsed = parse_llm_response(raw)
+    except json.JSONDecodeError as e:
+        print(f"LLM вернула невалидный JSON: {e}")
+        print("Сырой ответ:")
+        print(raw)
+        return
 
-    print(f"→ Сохраняю в файл...")
-    filename = save_rule(cve_id, parsed)
-
-    print(f"\nГотово! Правило сохранено в: {filename}")
     print(f"\nDetectable: {parsed.get('detectable')}")
     print(f"FP risk: {parsed.get('false_positive_risk')}")
     print(f"\n{parsed.get('rule', parsed.get('reason'))}")
+
+    if not args.no_save:
+        print(f"\nСохраняю в файл...")
+        filename = save_rule(args.cve_id, parsed, output_dir=args.output)
+        print(f"Правило сохранено в: {filename}")
+
+
+if __name__ == "__main__":
+    main()
