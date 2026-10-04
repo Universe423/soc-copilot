@@ -73,11 +73,22 @@ ARGS, ARGS_GET, ARGS_POST, ARGS_NAMES, REQUEST_FILENAME, FILES, FILES_NAMES
         messages=[{"role": "user", "content": prompt}],
         timeout=120,
     )
-
-    return response.choices[0].message.content  
+    
+    content = response.choices[0].message.content
+    if content is None:
+        raise ValueError(
+            f"LLM вернула пустой ответ. "
+            f"Finish reason: {response.choices[0].finish_reason}. "
+            f"Попробуй ещё раз или смени модель."
+        )
+    
+    return content
 
 def parse_llm_response(raw_response):
     """Извлекает JSON из ответа LLM, убирая возможные markdown-обёртки."""
+    if raw_response is None:
+        raise ValueError("Пустой ответ от LLM (None)")
+
     cleaned = raw_response.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("```")[1]
@@ -113,6 +124,50 @@ def save_rule(cve_id, parsed, output_dir="rules"):
 
     return filename
 
+VALID_VARIABLES = {
+    "REQUEST_URI", "REQUEST_LINE", "REQUEST_METHOD", "REQUEST_PROTOCOL",
+    "REQUEST_HEADERS", "REQUEST_COOKIES", "REQUEST_BODY",
+    "ARGS", "ARGS_GET", "ARGS_POST", "ARGS_NAMES",
+    "REQUEST_FILENAME", "FILES", "FILES_NAMES",
+    "REMOTE_ADDR", "REMOTE_HOST", "SERVER_NAME", "SERVER_PORT",
+}
+
+def validate_rule_syntax(rule_text):
+    """Проверяет синтаксис правила ModSecurity на типичные галлюцинации LLM.
+
+    Возвращает список найденных проблем. Пустой список = всё ок.
+    """
+    import re as _re
+    issues = []
+
+    if not rule_text or "SecRule" not in rule_text:
+        issues.append("Правило не содержит SecRule")
+        return issues
+
+    if "SecRule %{" in rule_text:
+        issues.append("SecRule использует макрос %{} вместо имени переменной")
+
+    if "@rx" not in rule_text and "@pm" not in rule_text:
+        issues.append("Отсутствует оператор @rx или @pm")
+
+    if "id:" not in rule_text:
+        issues.append("Отсутствует обязательный action id")
+
+    if "phase:" not in rule_text:
+        issues.append("Отсутствует обязательный action phase")
+
+    # Проверяем переменные (часть между SecRule и @rx/@pm)
+    match = _re.search(r'SecRule\s+(.+?)\s+["\']@(?:rx|pm)', rule_text)
+    if match:
+        vars_part = match.group(1)
+        variables = [v.strip() for v in vars_part.split("|")]
+        for var in variables:
+            # Убираем суффиксы типа :User-Agent
+            base_var = var.split(":")[0]
+            if base_var and base_var not in VALID_VARIABLES:
+                issues.append(f"Неизвестная переменная ModSecurity: {var}")
+
+    return issues
 
 def main():
     parser = argparse.ArgumentParser(
